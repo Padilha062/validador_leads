@@ -6,6 +6,7 @@ globais para uso em todo o projeto.
 """
 
 import os
+
 from dotenv import load_dotenv
 
 # Carrega variáveis do .env na raiz do projeto
