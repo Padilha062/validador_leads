@@ -4,3 +4,4 @@ httpx
 thefuzz
 python-Levenshtein
 pandas
+nest-asyncio
