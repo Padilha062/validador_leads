@@ -11,15 +11,16 @@ Execute com:
     streamlit run app.py
 """
 
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import List, Dict, Any
 
 import httpx
 import pandas as pd
 import streamlit as st
 
-from src.data_handler import parse_phone_list, sanitize_phone_number
-from src.whatsapp_client import fetch_profile_metadata
+from src.phone import parse_phone_list
+from src.whatsapp_client import fetch_profile
 from src.matcher import calculate_match_score
 
 
@@ -216,56 +217,39 @@ raw_phones = st.text_area(
 )
 
 
-# ── Função assíncrona principal ─────────────────────────────────────────────
-async def _process_phones(
+# ── Função principal (síncrona com threads) ─────────────────────────────────
+def _process_phones(
     lead_name: str,
     phones: List[str],
     progress_bar: Any,
     status_text: Any,
 ) -> List[Dict[str, Any]]:
-    """Consulta todos os números na Evolution API de forma assíncrona.
-
-    Utiliza um semáforo para limitar a 10 requisições simultâneas,
-    evitando sobrecarga na API.
-
-    Args:
-        lead_name: Nome do lead para cálculo do score.
-        phones: Lista de números já sanitizados.
-        progress_bar: Componente Streamlit de barra de progresso.
-        status_text: Componente Streamlit para texto de status.
-
-    Returns:
-        Lista de dicionários com os resultados de cada número.
-    """
-    semaphore = asyncio.Semaphore(10)
-    results: List[Dict[str, Any]] = []
     total = len(phones)
+    results: List[Dict[str, Any]] = [None] * total  # type: ignore[list-item]
+    lock = threading.Lock()
+    completed = [0]
 
-    async def _fetch_with_semaphore(
-        phone: str,
-        index: int,
-        client: httpx.AsyncClient,
-    ) -> Dict[str, Any]:
-        """Consulta um número respeitando o semáforo de concorrência."""
-        async with semaphore:
-            status_text.text(f"🔄 Consultando {phone} ({index + 1}/{total})...")
-            profile = await fetch_profile_metadata(phone, client)
-            score = calculate_match_score(lead_name, profile)
-            progress_bar.progress((index + 1) / total)
-            return {
-                "phone": phone,
-                "profile": profile,
-                "score": score,
+    def _fetch_single(phone: str) -> Dict[str, Any]:
+        profile = fetch_profile(phone, shared_client)
+        score = calculate_match_score(lead_name, profile)
+        with lock:
+            completed[0] += 1
+        return {"phone": phone, "profile": profile, "score": score}
+
+    max_workers = min(10, total)
+    with httpx.Client() as shared_client:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_fetch_single, phone): i
+                for i, phone in enumerate(phones)
             }
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                progress_bar.progress(completed[0] / total)
+                status_text.text(f"🔄 Consultado {completed[0]}/{total} números...")
 
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            _fetch_with_semaphore(phone, i, client)
-            for i, phone in enumerate(phones)
-        ]
-        results = await asyncio.gather(*tasks)
-
-    return list(results)
+    return results
 
 
 # ── Botão de ação ───────────────────────────────────────────────────────────
@@ -305,9 +289,7 @@ if clicked:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    results = asyncio.run(
-        _process_phones(lead_name, phones, progress_bar, status_text)
-    )
+    results = _process_phones(lead_name, phones, progress_bar, status_text)
 
     status_text.text("✅ Consulta finalizada!")
 
@@ -402,7 +384,7 @@ if clicked:
     df = pd.DataFrame(table_data)
     st.dataframe(
         df,
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         column_config={
             "⭐ Score": st.column_config.TextColumn(width="small"),
@@ -425,7 +407,7 @@ if clicked:
                 st.image(
                     r["profile"]["profilePictureUrl"],
                     caption=f"{r['profile'].get('name', '?')}\n{r['phone']}",
-                    width="stretch",
+                    use_container_width=True,
                 )
 
     st.success("✅ Análise completa! O número com maior pontuação está destacado acima.")

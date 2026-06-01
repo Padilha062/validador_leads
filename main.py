@@ -1,50 +1,64 @@
 import asyncio
+import sys
 
 import httpx
 
-from src.data_handler import iter_phone_numbers, load_mock_leads, normalize_phone
+from src.phone import parse_phone_list
 from src.matcher import calculate_match_score
-from src.whatsapp_client import fetch_profile_metadata
+from src.whatsapp_client import fetch_profile_async
 
 
-async def evaluate_lead(lead: dict, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> dict:
-    """Consulta todos os números de um lead e escolhe o melhor candidato."""
+async def _evaluate_lead(
+    lead_name: str,
+    phones: list[str],
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> dict:
     async def bounded_fetch(phone: str) -> dict:
         async with semaphore:
-            return await fetch_profile_metadata(phone, client)
+            return await fetch_profile_async(phone, client)
 
-    results = await asyncio.gather(*(bounded_fetch(phone) for phone in iter_phone_numbers(lead)))
+    profiles = await asyncio.gather(*(bounded_fetch(p) for p in phones))
 
-    scored = []
-    for phone, profile_data in zip(iter_phone_numbers(lead), results):
-        score = calculate_match_score(lead.get("lead_name", ""), profile_data)
-        scored.append({"phone": normalize_phone(phone), "score": score, "profile_data": profile_data})
+    candidates = [
+        {
+            "phone": phone,
+            "score": calculate_match_score(lead_name, profile),
+            "profile": profile,
+        }
+        for phone, profile in zip(phones, profiles)
+    ]
+    winner = max(candidates, key=lambda c: c["score"]) if candidates else None
+    return {"lead_name": lead_name, "winner": winner, "candidates": candidates}
 
-    winner = max(scored, key=lambda item: item["score"]) if scored else None
-    return {"lead": lead, "winner": winner, "candidates": scored}
 
+async def _run() -> None:
+    if len(sys.argv) < 3:
+        print('Uso: python main.py "<nome do lead>" "<números separados por vírgula>"')
+        sys.exit(1)
 
-async def main_async() -> None:
-    """Ponto de entrada assíncrono do sistema."""
-    leads = load_mock_leads()
-    semaphore = asyncio.Semaphore(10)
+    phones = parse_phone_list(sys.argv[2])
+    if not phones:
+        print("Nenhum número válido encontrado.")
+        sys.exit(1)
 
+    lead_name = sys.argv[1]
     async with httpx.AsyncClient() as client:
-        evaluations = await asyncio.gather(*(evaluate_lead(lead, client, semaphore) for lead in leads))
+        result = await _evaluate_lead(lead_name, phones, client, asyncio.Semaphore(10))
 
-    for evaluation in evaluations:
-        lead = evaluation["lead"]
-        winner = evaluation["winner"]
-
-        if winner is None:
-            print(f"{lead['lead_name']}: nenhum número foi validado.")
-            continue
-
+    winner = result["winner"]
+    if winner:
         print(
-            f"Lead {lead['lead_name']} -> vencedor: {winner['phone']} "
-            f"(score {winner['score']:.2f}, perfil={winner['profile_data'].get('profile_name', '-')})"
+            f"Lead: {lead_name} → {winner['phone']} "
+            f"(score {winner['score']:.2f}, perfil: {winner['profile'].get('name', '—')})"
         )
+    else:
+        print(f"{lead_name}: nenhum número validado.")
+
+    print("\nCandidatos:")
+    for c in result["candidates"]:
+        print(f"  {c['phone']} → score: {c['score']:.2f}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    asyncio.run(_run())
